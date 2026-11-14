@@ -1,0 +1,6 @@
+backup/
+*.exe
+*.pdb
+self-test-result.txt
+refresh-test-result.txt
+界面预览*.png
