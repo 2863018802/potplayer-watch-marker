@@ -115,7 +115,7 @@ internal sealed class SettingsWindow : Form
             ReadOnly = true, BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(30, 31, 34),
             ForeColor = Color.FromArgb(225, 222, 215), Font = Font,
             Bounds = new Rectangle(30, 100, 640, 450),
-            Text = "开始使用\n\n启动工具后，照常用 PotPlayer 打开 MP4。播放器内部自动下一集或手动换集，都可以记录。\n\n关闭播放器后\n\n工具会更新最后一集所在目录的箭头标记，并刷新已打开的对应文件夹。按名称排序即可找到观看位置，双击标记可打开视频。\n\n标记文件\n\n显示为“视频名称 看到这里”，实际格式为 .lnk 快捷方式。每个文件夹保留一个工具标记，请保留快捷方式描述中的归属标识。\n\n后台运行\n\n关闭此窗口后继续在托盘运行。双击托盘图标可重新打开。开机启动、通知提醒可在设置中调整并保存。退出工具后会停止记录。\n\n监控范围\n\n" + root + "\n程序监控所在文件夹的上一级目录及子目录中的 MP4。\n\n运行限制\n\n播放器标题需要显示 MP4 文件名。同名视频无法唯一定位时会提示。关闭通知后，异常仍可在设置页面查看。"
+            Text = "开始使用\n\n启动工具后，照常用 PotPlayer 打开 MP4。播放器内部自动下一集或手动换集，都可以记录。\n\n关闭播放器后\n\n工具会更新最后一集所在目录的箭头标记，并刷新已打开的对应文件夹。按名称排序即可找到观看位置，双击标记可从保存的时分秒继续播放。\n\n标记文件\n\n显示为“视频名称 看到这里”，实际格式为 .lnk 快捷方式。每个文件夹保留一个工具标记，请保留快捷方式描述中的归属标识。\n\n后台运行\n\n关闭此窗口后继续在托盘运行。双击托盘图标可重新打开。开机启动、通知提醒可在设置中调整并保存。退出工具后会停止记录。\n\n监控范围\n\n" + root + "\n程序监控所在文件夹的上一级目录及子目录中的 MP4。\n\n运行限制\n\n播放器标题需要显示 MP4 文件名。同名视频无法唯一定位时会提示。关闭通知后，异常仍可在设置页面查看。"
         };
         help.Text = help.Text.Replace("\n", "\r\n");
         helpPage.Controls.Add(help);
@@ -143,7 +143,7 @@ internal sealed class SettingsWindow : Form
         settingsNav.Click += (s, e) => navigate(false);
         helpNav.Click += (s, e) => navigate(true);
         navigate(false);
-        var version = TextLabel("版本 0.4.0", 9F, Color.FromArgb(147, 140, 126));
+        var version = TextLabel("版本 0.5.0", 9F, Color.FromArgb(147, 140, 126));
         version.SetBounds(26, 538, 130, 26);
         sidebar.Controls.Add(version);
     }
@@ -177,6 +177,8 @@ internal sealed class Session
     public int Pid { get; set; }
     public long Started { get; set; }
     public string File { get; set; }
+    public long? PositionMs { get; set; }
+    public string Player { get; set; }
 }
 
 internal static class Program
@@ -194,6 +196,7 @@ internal static class Program
     static string owner;
     static string lastError;
     static string current;
+    static long? currentPosition;
     static Preferences preferences = new Preferences();
     static SettingsWindow settingsWindow;
     static System.Threading.EventWaitHandle showRequested;
@@ -204,6 +207,7 @@ internal static class Program
     const string RunName = "PotWatchMarker";
     static System.Threading.Mutex mutex;
     delegate bool EnumWindow(IntPtr window, IntPtr argument);
+    [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr query, IntPtr argument, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow callback, IntPtr argument);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
@@ -323,6 +327,7 @@ internal static class Program
     static void RefreshStatus()
     {
         string title = playing ? "正在记录 · " + Path.GetFileName(current ?? "等待识别") : "等待 PotPlayer 播放";
+        if (playing && currentPosition.HasValue) title += "\n" + FormatPosition(currentPosition.Value);
         string description = lastError ?? (playing ? "关闭 PotPlayer 后自动更新标记\n" + Path.GetDirectoryName(current ?? Root) :
             lastMarked != null ? "最近标记\n" + lastMarked : "后台监控已启动");
         if (settingsWindow != null && !settingsWindow.IsDisposed) settingsWindow.RefreshStatus(title, description);
@@ -406,6 +411,19 @@ internal static class Program
         return result;
     }
 
+    static long? QueryPlayer(IntPtr window, int query)
+    {
+        UIntPtr result;
+        if (window == IntPtr.Zero || SendMessageTimeout(window, 1024, new IntPtr(query), IntPtr.Zero, 2, 200, out result) == IntPtr.Zero) return null;
+        return unchecked((long)result.ToUInt64());
+    }
+
+    static string FormatPosition(long milliseconds)
+    {
+        var time = TimeSpan.FromMilliseconds(milliseconds);
+        return ((long)time.TotalHours).ToString("00") + ":" + time.Minutes.ToString("00") + ":" + time.Seconds.ToString("00");
+    }
+
     static string Resolve(string name, Process player)
     {
         if (Path.IsPathRooted(name) && InsideRoot(name) && File.Exists(name)) return name;
@@ -462,8 +480,21 @@ internal static class Program
                     changed = true;
                 }
                 // Clear a previous episode when the new title cannot be resolved safely.
-                if (session.File != path) { session.File = path; changed = true; }
+                if (session.File != path) { session.File = path; session.PositionMs = null; changed = true; }
+                if (path != null)
+                {
+                    string executable = player.MainModule.FileName;
+                    if (session.Player != executable) { session.Player = executable; changed = true; }
+                    long? state = QueryPlayer(player.MainWindowHandle, 20486);
+                    long? position = QueryPlayer(player.MainWindowHandle, 20484);
+                    long? duration = QueryPlayer(player.MainWindowHandle, 20482);
+                    if ((state == 1 || state == 2) && position >= 0 && duration > 0 && position <= duration && WindowFile(player.Id) == name)
+                    {
+                        if (session.PositionMs != position) { session.PositionMs = position; changed = true; }
+                    }
+                }
                 current = path ?? ("待识别 " + name);
+                currentPosition = session.PositionMs;
                 playing = true;
             }
             if (changed) Save();
@@ -471,7 +502,7 @@ internal static class Program
             {
                 try
                 {
-                    if (ended.File != null) UpdateMarker(ended.File, owner);
+                    if (ended.File != null) UpdateMarker(ended.File, owner, ended.Player, ended.PositionMs);
                     lastError = null;
                     if (ended.File != null)
                     {
@@ -570,14 +601,16 @@ internal static class Program
         finally { if (link != null) Marshal.FinalReleaseComObject(link); Marshal.FinalReleaseComObject(shell); }
     }
 
-    static void WriteShortcut(string path, string video, string identity)
+    static void WriteShortcut(string path, string video, string identity, string player = null, long? positionMs = null)
     {
         object shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
         object link = null;
         try
         {
             link = shell.GetType().InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { path });
-            ComProperty(link, "TargetPath", video);
+            bool resume = positionMs.HasValue && !string.IsNullOrEmpty(player) && File.Exists(player);
+            ComProperty(link, "TargetPath", resume ? player : video);
+            if (resume) ComProperty(link, "Arguments", "\"" + video + "\" /new /seek=" + (positionMs.Value / 1000.0).ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
             ComProperty(link, "WorkingDirectory", Path.GetDirectoryName(video));
             ComProperty(link, "Description", identity);
             ComProperty(link, "IconLocation", MarkerIcon + ",0");
@@ -609,7 +642,7 @@ internal static class Program
         }
     }
 
-    internal static void UpdateMarker(string video, string identity)
+    internal static void UpdateMarker(string video, string identity, string player = null, long? positionMs = null)
     {
         if (!File.Exists(video)) throw new IOException("视频文件已移动，保留旧标记\n" + video);
         string folder = Path.GetDirectoryName(video);
@@ -621,7 +654,7 @@ internal static class Program
         string temporary = Path.Combine(folder, ".watchmarker-" + Guid.NewGuid().ToString("N") + ".lnk");
         try
         {
-            WriteShortcut(temporary, video, identity);
+            WriteShortcut(temporary, video, identity, player, positionMs);
             if (File.Exists(target))
             {
                 if (!Owned(target, identity)) throw new IOException("标记文件归属已变化\n" + target);
@@ -648,6 +681,11 @@ internal static class Program
         string shortcut = Path.Combine(folder, "第02集" + Suffix + ".lnk");
         if (ReadShortcut(shortcut, "TargetPath") != b || !ReadShortcut(shortcut, "IconLocation").StartsWith(MarkerIcon, StringComparison.OrdinalIgnoreCase))
             throw new Exception("快捷方式目标或图标错误");
+        UpdateMarker(b, identity, Application.ExecutablePath, 754321);
+        if (ReadShortcut(shortcut, "TargetPath") != Application.ExecutablePath || ReadShortcut(shortcut, "Arguments") != "\"" + b + "\" /new /seek=754.321")
+            throw new Exception("定位播放快捷方式参数错误");
+        if (Json.Deserialize<Session>("{\"Pid\":1,\"File\":\"old.mp4\"}").PositionMs != null)
+            throw new Exception("旧版本观看记录兼容失败");
         File.WriteAllText(Path.Combine(folder, "用户文件" + Suffix), "personal");
         UpdateMarker(a, identity);
         if (File.ReadAllText(Path.Combine(folder, "用户文件" + Suffix)) != "personal") throw new Exception("用户文件保护失败");
